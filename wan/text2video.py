@@ -24,14 +24,15 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
-
+from diffusers import FlowMatchEulerDiscreteScheduler
+from typing import List, Optional, Tuple, Union
 class WanT2V:
 
     def __init__(
         self,
         config,
         checkpoint_dir,
+        dit_dir,
         device_id=0,
         rank=0,
         t5_fsdp=False,
@@ -83,8 +84,8 @@ class WanT2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        logging.info(f"Creating WanModel from {dit_dir}")
+        self.model = WanModel.from_pretrained(dit_dir)
         self.model.eval().requires_grad_(False)
 
         if use_usp:
@@ -221,6 +222,11 @@ class WanT2V:
                     sample_scheduler,
                     device=self.device,
                     sigmas=sampling_sigmas)
+            elif sample_solver == 'flow_matching':
+                sample_scheduler = CustomFlowScheduler(shift=shift)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device)
+                timesteps = sample_scheduler.timesteps
             else:
                 raise NotImplementedError("Unsupported solver.")
 
@@ -229,13 +235,15 @@ class WanT2V:
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
-
+            # debug
+            rank = dist.get_rank() if dist.is_initialized() else 0
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
-
+                if rank == 0:
+                    print("Timestep:", timestep)
                 self.model.to(self.device)
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
@@ -265,7 +273,95 @@ class WanT2V:
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
 
         return videos[0] if self.rank == 0 else None
+
+
+# --- 1. 定义一个继承自原始 Scheduler 的新类 ---
+class CustomFlowScheduler(FlowMatchEulerDiscreteScheduler):
+    
+    # --- 2. 重写 step 方法 ---
+    def step(
+        self,
+        model_output: torch.FloatTensor,
+        timestep: Union[float, torch.FloatTensor],
+        sample: torch.FloatTensor,
+        s_churn: float = 0.0,
+        s_tmin: float = 0.0,
+        s_tmax: float = float("inf"),
+        s_noise: float = 1.0,
+        generator: Optional[torch.Generator] = None,
+        per_token_timesteps: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ):
+        """
+        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
+        process from the learned model outputs (most often the predicted noise).
+
+        Args:
+            model_output (`torch.FloatTensor`):
+                The direct output from learned diffusion model.
+            timestep (`float`):
+                The current discrete timestep in the diffusion chain.
+            sample (`torch.FloatTensor`):
+                A current instance of a sample created by the diffusion process.
+            s_churn (`float`):
+            s_tmin  (`float`):
+            s_tmax  (`float`):
+            s_noise (`float`, defaults to 1.0):
+                Scaling factor for noise added to the sample.
+            generator (`torch.Generator`, *optional*):
+                A random number generator.
+            per_token_timesteps (`torch.Tensor`, *optional*):
+                The timesteps for each token in the sample.
+            return_dict (`bool`):
+                Whether or not to return a
+                [`~schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteSchedulerOutput`] or tuple.
+
+        Returns:
+            [`~schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteSchedulerOutput`] or `tuple`:
+                If return_dict is `True`,
+                [`~schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteSchedulerOutput`] is returned,
+                otherwise a tuple is returned where the first element is the sample tensor.
+        """
+
+        if (
+            isinstance(timestep, int)
+            or isinstance(timestep, torch.IntTensor)
+            or isinstance(timestep, torch.LongTensor)
+        ):
+            raise ValueError(
+                (
+                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
+                    " `FlowMatchEulerDiscreteScheduler.step()` is not supported. Make sure to pass"
+                    " one of the `scheduler.timesteps` as a timestep."
+                ),
+            )
+
+        if self.step_index is None:
+            self._init_step_index(timestep)
+
+        # Upcast to avoid precision issues when computing prev_sample
+        sample = sample.to(torch.float32)
+
+
+        sigma = self.sigmas[self.step_index]
+        print(f"self.step_index: {self.step_index}, sigma: {sigma}")
+        sigma_next = self.sigmas[self.step_index + 1]
+        print(f"self.step_index + 1: {self.step_index + 1}, sigma_next: {sigma_next}")
+        dt = sigma_next - sigma
+
+        prev_sample = sample - dt * model_output
+
+        # upon completion increase step index by one
+        self._step_index += 1
+        if per_token_timesteps is None:
+            # Cast sample back to model compatible dtype
+            prev_sample = prev_sample.to(model_output.dtype)
+
+        if not return_dict:
+            return (prev_sample,)
+        else:
+            NotImplementedError(
+                "Returning a `FlowMatchEulerDiscreteSchedulerOutput` is not implemented for the custom scheduler."
+            )

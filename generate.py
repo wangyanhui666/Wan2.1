@@ -5,7 +5,10 @@ import os
 import sys
 import warnings
 from datetime import datetime
-
+try:
+    import torch_npu
+except ImportError:
+    pass
 warnings.filterwarnings('ignore')
 
 import random
@@ -13,12 +16,38 @@ import random
 import torch
 import torch.distributed as dist
 from PIL import Image
-
+import importlib
 import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
 
+def is_npu_available():
+    "Checks if `torch_npu` is installed and potentially if a NPU is in the environment"
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("torch_npu") is None:
+        return False
+
+    import torch_npu
+
+    try:
+        # Will raise a RuntimeError if no NPU is found
+        _ = torch.npu.device_count()
+        return torch.npu.is_available()
+    except RuntimeError:
+        return False
+if is_npu_available():
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+    torch.npu.config.allow_internal_format = False
+
+def init_distributed_for_train(uly_sp_size: int):
+    backend = "hccl" if is_npu_available() else "nccl"
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+    )
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    global_rank = dist.get_rank()
 
 EXAMPLE_PROMPT = {
     "t2v-1.3B": {
@@ -125,6 +154,12 @@ def _parse_args():
         default=None,
         help="The path to the checkpoint directory.")
     parser.add_argument(
+        "--dit_path",
+        type=str,
+        default=None,
+        help="The path to the DiT checkpoint."
+    )
+    parser.add_argument(
         "--offload_model",
         type=str2bool,
         default=None,
@@ -229,7 +264,7 @@ def _parse_args():
         "--sample_solver",
         type=str,
         default='unipc',
-        choices=['unipc', 'dpm++'],
+        choices=['unipc','flow_matching','dpm++'],
         help="The solver used to sample.")
     parser.add_argument(
         "--sample_steps", type=int, default=None, help="The sampling steps.")
@@ -243,7 +278,11 @@ def _parse_args():
         type=float,
         default=5.0,
         help="Classifier free guidance scale.")
-
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="outputs",
+        help="The directory to save the generated image or video to.")
     args = parser.parse_args()
 
     _validate_args(args)
@@ -264,31 +303,24 @@ def _init_logging(rank):
 
 
 def generate(args):
-    rank = int(os.getenv("RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
-    _init_logging(rank)
+    init_distributed_for_train(1)
+    device=torch.device("cuda")
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    rank = global_rank
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device_id = local_rank
+    print(f"world size: {world_size}")
+    print(f"global rank: {global_rank}")
+    print(f"rank: {rank}")
+    print(f"local rank: {local_rank}")
+    print(f"device: {device}")
+
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
-    if world_size > 1:
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=rank,
-            world_size=world_size)
-    else:
-        assert not (
-            args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1 or args.ring_size > 1
-        ), f"context parallel are not supported in non-distributed environments."
-
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
         from xfuser.core.distributed import (
@@ -303,7 +335,6 @@ def generate(args):
             ring_degree=args.ring_size,
             ulysses_degree=args.ulysses_size,
         )
-
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
             prompt_expander = DashScopePromptExpander(
@@ -360,7 +391,8 @@ def generate(args):
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            device_id=device,
+            dit_dir=args.dit_path,
+            device_id=device_id,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -554,13 +586,40 @@ def generate(args):
     else:
         raise ValueError(f"Unkown task type: {args.task}")
 
-    if rank == 0:
+    if global_rank == 0:
+        # Create save directory if it doesn't exist
+        os.makedirs(args.save_dir, exist_ok=True)
+        
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/",
-                                                                     "_")[:50]
+            formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:10]  # Shortened to 10 chars
+            
+            # Use shortened parameter names
+            filename_parts = [
+                f"{args.task}",  # Task already short (e.g., t2v-1.3B)
+                f"sz{args.size.replace('*','x') if sys.platform=='win32' else args.size}",
+                f"u{args.ulysses_size}",
+                f"r{args.ring_size}",
+                f"st{args.sample_steps}",
+                f"sol{args.sample_solver[:2]}",  # First 2 chars of solver
+                f"sh{args.sample_shift}",
+                f"gs{args.sample_guide_scale}"
+            ]
+            
+            # Add sparse attention parameters if enabled
+        
+            # Add prompt and time at the end
+            filename_parts.append(formatted_prompt)
+            filename_parts.append(formatted_time)
+            
+            # Join all parts with underscore
             suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            filename = "_".join(filename_parts) + suffix
+            args.save_file = os.path.join(args.save_dir, filename)
+        else:
+            # If save_file has a path but no directory specified, put it in save_dir
+            if os.path.dirname(args.save_file) == '':
+                args.save_file = os.path.join(args.save_dir, args.save_file)
 
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")
