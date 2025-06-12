@@ -351,7 +351,7 @@ class CustomFlowScheduler(FlowMatchEulerDiscreteScheduler):
         print(f"self.step_index + 1: {self.step_index + 1}, sigma_next: {sigma_next}")
         dt = sigma_next - sigma
 
-        prev_sample = sample - dt * model_output
+        prev_sample = sample + dt * model_output
 
         # upon completion increase step index by one
         self._step_index += 1
